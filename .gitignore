@@ -1,0 +1,10 @@
+.env
+.idea/
+__pycache__/
+*.pyc
+beiwanglu.txt
+cd
+git
+chat_history.json
+config.json
+notebook.json
