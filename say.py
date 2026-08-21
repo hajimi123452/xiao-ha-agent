@@ -10,8 +10,7 @@ import random
 import json
 import os
 import requests
-
-from tools.llm_engine import agent_loop
+from tools.langchain_tools import build_tools, run_agent, llm
 from dotenv import load_dotenv
 
 from tools import weather
@@ -178,6 +177,7 @@ def main():
                     "🔍 找笔记（例如：记事本找 天气）\n"
                     "有需要就直接告诉我吧！"
                 )
+
                 print(reply_content)  # 加上这一行
                 history.append({"role": "ai", "content": reply_content})
                 continue
@@ -195,25 +195,24 @@ def main():
             # 记录用户消息
             history.append({"role": "user", "content": user_input})
 
-            # 定义工具执行器（可以放在主循环外面，只定义一次）
-            tool_executors = {
-                "weather": lambda arg: weather.run(f"天气 {arg}"),
-                "joke": lambda arg: joke.run(),
-                "time": lambda arg: time_tool.run(),
-                "name": lambda arg: f"{user_name}你好！我叫小哈，是你的第一个AI Agent雏形！",
-                "notebook": lambda arg: notebook_tool.run(notebook, f"记事本 {arg}"),
-                "calculator": lambda arg: calculator.run(f"计算 {arg}"),
-                "translator": lambda arg: translator.run(f"翻译 {arg}")
-            }
+            # 使用 LangChain 风格 ReAct Agent 生成回答
+            tools = build_tools(user_name, notebook)  # 动态构建工具列表
 
-            # 生成回答（直接调用 agent_loop）
             try:
-                reply_content = agent_loop(user_input, history, tool_executors)
+
+                reply_content = run_agent(
+                    user_input=user_input,
+                    user_name=user_name,
+                    notebook=notebook,
+                    llm=llm,
+                    tools=tools,
+                    verbose=False,  # 调试时可改为 True、False
+                    max_steps=8
+                )
             except Exception as e:
                 reply_content = f"内部处理错误：{e}"
-            # 输出回答
-            print(reply_content)
 
+            print(reply_content)
             # 记录 AI 消息
             history.append({"role": "ai", "content": reply_content})
 
