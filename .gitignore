@@ -8,3 +8,11 @@ git
 chat_history.json
 config.json
 notebook.json
+
+chroma_db/
+reply.mp3
+*.mp3
+test_vision.py
+frontend/
+.venv/
+
