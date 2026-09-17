@@ -4,9 +4,16 @@ import json
 import re
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
+from tools import rag_engine
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from tools.vision_tool import image_understanding
+from tools.web_search import web_search
+#debug错误日志
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # 导入原有工具模块
 from tools import weather, joke, time_tool, calculator, translator, notebook
@@ -20,8 +27,9 @@ llm = ChatOpenAI(
     api_key=os.getenv("LLM_API_KEY"),
     base_url=base_url,
     temperature=0,
+    request_timeout=30,      # 请求超时时间（秒）
+    max_retries=2,           # 失败后自动重试次数
 )
-
 # ========== 封装工具（无参数工具添加 dummy 默认参数） ==========
 @tool
 def weather_tool(city: str) -> str:
@@ -65,6 +73,10 @@ def build_tools(user_name: str, notebook_list: list):
     def name_tool(dummy: str = "") -> str:
         """回答你的名字相关问题。无需参数。"""
         return f"{user_name}你好！我叫小哈，是你的AI助手。"
+    @tool
+    def knowledge_base_tool(question: str) -> str:
+        """根据本地知识库回答问题。参数 question 是用户的问题。"""
+        return rag_engine.rag_answer(question)
 
     return [
         weather_tool,
@@ -74,13 +86,52 @@ def build_tools(user_name: str, notebook_list: list):
         translator_tool,
         make_notebook_tool(notebook_list),
         name_tool,
+        knowledge_base_tool,
+        image_understanding,
+        web_search,
     ]
 
 # ========== JSON 决策 Agent 循环 ==========
-def run_agent(user_input, user_name, notebook, llm, tools, max_steps=8, verbose=False):
+def _extract_leaked_tool_call(text, tool_map):
+    """检测模型把「工具调用」当成最终回复直接吐出来的情况。
+
+    例如最终回复是 "joke_tool: 1" 或 "weather_tool: 北京"，
+    这明显是想调用工具而不是回答用户，这里识别出来并返回 (工具名, 参数)。
     """
-    使用 JSON 决策的 Agent 循环，避免 ReAct 格式解析问题。
+    if not text:
+        return None
+    line = text.strip().split("\n")[0].strip().strip("`").strip()
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:：]\s*(.*)$", line)
+    if not match:
+        # 允许 "工具名 参数" 这种没有冒号的写法
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+(.+)$", line)
+    if not match:
+        return None
+    name, arg = match.group(1), match.group(2).strip()
+    if name in tool_map:
+        return name, arg
+    return None
+
+
+def run_agent(user_input, history, user_name, notebook, llm, tools, max_steps=8, verbose=False):
     """
+    使用 JSON 决策的 Agent 循环，支持多轮对话记忆。
+    history: 列表，元素为 {"role": "user"/"ai", "content": "..."}
+    """
+    # 1. 构建外部历史消息
+    history_messages = []
+    if history:
+        for msg in history:
+            if msg["role"] == "user":
+                history_messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "ai":
+                history_messages.append(AIMessage(content=msg["content"]))
+
+    MAX_HISTORY_MESSAGES = 10
+    if len(history_messages) > MAX_HISTORY_MESSAGES:
+        history_messages = history_messages[-MAX_HISTORY_MESSAGES:]
+
+    # 2. 构建工具描述和名称
     tool_descriptions = "\n".join([f"{t.name}: {t.description}" for t in tools])
     tool_names = ", ".join([t.name for t in tools])
 
@@ -96,32 +147,34 @@ def run_agent(user_input, user_name, notebook, llm, tools, max_steps=8, verbose=
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
+        MessagesPlaceholder(variable_name="history"),
         ("human", "{input}")
     ])
 
     tool_map = {t.name: t for t in tools}
-
     scratchpad = []
     current_input = user_input
 
     for step in range(max_steps):
         if verbose:
             print(f"--- Step {step+1} ---")
+
         chain = prompt | llm
         try:
-            response = chain.invoke({"input": current_input})
+            response = chain.invoke({
+                "input": current_input,
+                "history": history_messages
+            })
         except Exception as e:
             print(f"DEBUG: LLM 调用异常: {e}")
             return f"内部处理错误：{e}"
 
         text = response.content.strip()
-        if verbose:
-            print("DEBUG: 模型原始输出:", repr(text))
 
         if not text:
             return "抱歉，我暂时无法回答。"
 
-        # 尝试直接解析为 JSON
+        # 解析 JSON
         decision = None
         try:
             clean_text = text
@@ -133,7 +186,6 @@ def run_agent(user_input, user_name, notebook, llm, tools, max_steps=8, verbose=
         except json.JSONDecodeError:
             pass
 
-        # 如果直接 JSON 失败，尝试提取包含 tool 或 final_answer 的对象
         if decision is None:
             matches = re.findall(r'\{.*?\}', text, re.DOTALL)
             for match in matches:
@@ -145,13 +197,12 @@ def run_agent(user_input, user_name, notebook, llm, tools, max_steps=8, verbose=
                 except json.JSONDecodeError:
                     continue
 
-        # 如果仍然没有决策，尝试处理纯文本工具命令（工具名 + JSON/字符串参数）
+        # 处理纯文本工具命令
         if decision is None:
             lines = text.split('\n')
             if len(lines) >= 2 and lines[0].strip() in tool_map:
                 tool_name = lines[0].strip()
                 arg_str = lines[1].strip() if len(lines) > 1 else ""
-                # 尝试解析参数为 JSON
                 try:
                     arg_dict = json.loads(arg_str)
                     if isinstance(arg_dict, dict):
@@ -175,12 +226,27 @@ def run_agent(user_input, user_name, notebook, llm, tools, max_steps=8, verbose=
                 current_input = user_input + "\n" + "\n".join([m.content for m in scratchpad])
                 continue
             else:
-                # 直接返回文本
                 return text
 
-        # 检查是否有 final_answer
+        # 最终答案
         if decision and "final_answer" in decision and decision["final_answer"]:
-            return decision["final_answer"]
+            final_text = str(decision["final_answer"]).strip()
+            # 防呆：模型有时会把工具调用写进 final_answer（如 "joke_tool: 1"），
+            # 这时不能直接回给用户，而是真的去执行这个工具
+            leaked = _extract_leaked_tool_call(final_text, tool_map)
+            if leaked:
+                tool_name, arg = leaked
+                if verbose:
+                    print(f"DEBUG: final_answer 中检测到工具调用 {tool_name}({arg})，改为执行")
+                try:
+                    observation = tool_map[tool_name].run(arg if arg else "")
+                except Exception as e:
+                    observation = f"工具执行失败：{e}"
+                scratchpad.append(AIMessage(content=f'{{"tool": "{tool_name}", "arg": "{arg}"}}'))
+                scratchpad.append(HumanMessage(content=f"工具执行结果：{observation}"))
+                current_input = user_input + "\n" + "\n".join([m.content for m in scratchpad])
+                continue
+            return final_text
 
         # 执行工具
         tool_name = decision.get("tool")

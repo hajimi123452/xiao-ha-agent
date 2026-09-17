@@ -18,6 +18,10 @@ from tools import joke
 from tools import time_tool
 from tools import calculator, translator
 import tools.notebook as notebook_tool
+from langchain_core.caches import InMemoryCache
+from langchain_core.globals import set_llm_cache
+
+set_llm_cache(InMemoryCache())
 
 load_dotenv()  # 加载 .env
 # ======================== 文件 I/O 安全封装 ========================
@@ -145,6 +149,9 @@ def main():
     notebook = load_notebook()
     history = load_history()
 
+    from tools import rag_engine
+    rag_engine.initialize_knowledge_base()
+
     print(f"我是小哈AI助手，{user_name}，有什么可以帮你？")
 
     # 3. 主循环
@@ -202,11 +209,12 @@ def main():
 
                 reply_content = run_agent(
                     user_input=user_input,
+                    history=history,  # 新增，传入历史
                     user_name=user_name,
                     notebook=notebook,
                     llm=llm,
                     tools=tools,
-                    verbose=False,  # 调试时可改为 True、False
+                    verbose=False,
                     max_steps=8
                 )
             except Exception as e:

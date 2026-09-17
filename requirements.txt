@@ -4,3 +4,12 @@ gradio
 langchain
 langchain-openai
 langchain-core
+langchain-chroma
+chromadb
+langchain-text-splitters
+langchain-huggingface
+sentence-transformers
+langchain-community
+pypdf
+edge-tts
+openai-whisper
